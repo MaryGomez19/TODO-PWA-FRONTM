@@ -423,6 +423,7 @@ export default function Dashboard() {
                   <option value="Pendiente">Pendiente</option>
                   <option value="En Progreso">En Progreso</option>
                   <option value="Completada">Completada</option>
+                  
                 </select>
 
                 <div className="content">
