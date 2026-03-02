@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import { api, setAuth } from "../api";
 import {
   cacheTasks,
@@ -17,6 +17,7 @@ type Task = {
   title: string;
   description?: string;
   status: Status;
+  image?: string; // URL de imagen asociada, si la hay
   clienteId?: string;
   createdAt?: string;
   deleted?: boolean;
@@ -40,6 +41,7 @@ function normalizeTask(x: any): Task {
       x?.status === "Pendiente"
         ? x.status
         : "Pendiente",
+    image: x?.image ?? undefined, // undefined si no hay imagen, o URL si la hay
     clienteId: x?.clienteId,
     createdAt: x?.createdAt,
     deleted: !!x?.deleted,
@@ -53,12 +55,14 @@ export default function Dashboard() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  const [image, setImage] = useState<File | null>(null); // para almacenar la imagen seleccionada antes de subirla a Cloudinary
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<"all" | "active" | "completed">("all");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const [editingDescription, setEditingDescription] = useState("");
   const [online, setOnline] = useState<boolean>(navigator.onLine);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setAuth(localStorage.getItem("token"));
@@ -119,6 +123,23 @@ export default function Dashboard() {
     e.preventDefault();
     const t = title.trim();
     const d = description.trim();
+    let imageUrl = null; // <- URL de imagen subida, si hay
+
+    if (image && navigator.onLine) {
+      const formData = new FormData();
+      formData.append("file", image);
+      formData.append("upload_preset", "react_uploads");     // <- pon tu upload_preset de cloudinary aquí
+
+      const upload = await fetch(
+        "https://api.cloudinary.com/v1_1/dfrnbcqs0/image/upload",
+        { method: "POST", body: formData }
+      );
+  
+      const result = await upload.json();
+      console.log("🖼️ Respuesta Cloudinary completa:", result);  // ver todo el objeto
+      console.log("✅ URL de imagen:", result.secure_url);
+      imageUrl = result.secure_url ?? null; // <- URL segura de Cloudinary o null si falla
+    }
     if (!t) return;
 
     // Crear local inmediatamente
@@ -127,6 +148,7 @@ export default function Dashboard() {
       _id: clienteId,
       title: t,
       description: d,
+      image: imageUrl, // <- guarda URL de imagen en la tarea
       status: "Pendiente" as Status,
       pending: !navigator.onLine, // <- marca “Falta sincronizar” si no hay red
     });
@@ -135,6 +157,8 @@ export default function Dashboard() {
     await putTaskLocal(localTask);
     setTitle("");
     setDescription("");
+    setImage(null); // limpiar selector de imagen
+    if (fileInputRef.current) fileInputRef.current.value = "";
 
     if (!navigator.onLine) {
       const op: OutboxOp = {
@@ -150,7 +174,8 @@ export default function Dashboard() {
 
     // Online directo
     try {
-      const { data } = await api.post("/tasks", { title: t, description: d });
+      console.log("📤 Enviando al backend:", { title: t, description: d, image: imageUrl });
+      const { data } = await api.post("/tasks", { title: t, description: d, image: imageUrl }); //ENVIAR URL de imagen al backend cuando haya internet
       const created = normalizeTask(data?.task ?? data);
       setTasks((prev) => prev.map((x) => (x._id === clienteId ? created : x)));
       await putTaskLocal(created);
@@ -329,8 +354,22 @@ export default function Dashboard() {
             placeholder="Descripción (opcional)…"
             rows={2}
           />
+          {/* Selector de imagen */}
+          <input
+            ref={fileInputRef}  
+            type="file"
+            accept="image/*"
+            onChange={(e) => setImage(e.target.files?.[0] ?? null)}
+          />
+          {image && (
+            <img 
+            src={URL.createObjectURL(image)}
+            alt="preview"
+            style={{ width: 120, marginTop: 10, borderRadius: 8 }}
+            />
+            )}
           <button className="btn">Agregar</button>
-        </form>
+        </form> 
 
         {/* ===== Toolbar ===== */}
         <div className="toolbar">
@@ -410,6 +449,7 @@ export default function Dashboard() {
                         {t.title}
                       </span>
                       {t.description && <p className="desc">{t.description}</p>}
+                      {t.image && (<img src={t.image} alt="imagen de tarea" style={{ width: 100, marginTop: 6, borderRadius: 6 }}/>)} 
                       {(t.pending || isLocalId(t._id)) && (
                         <span
                           className="badge"
