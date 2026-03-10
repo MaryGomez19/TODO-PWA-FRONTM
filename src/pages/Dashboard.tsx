@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import { api, setAuth } from "../api";
 import {
   cacheTasks,
@@ -10,13 +10,16 @@ import {
 } from "../offline/db";
 import { syncNow } from "../offline/sync"; // ⬅️ SOLO syncNow
 
-type Status = "Pendiente" | "En Progreso" | "Completada";
+type Status = "Pendiente" | "En progreso" | "Completada";
 
 type Task = {
   _id: string;                 // serverId o clienteId (offline)
   title: string;
   description?: string;
   status: Status;
+  image?: string; // URL de imagen asociada, si la hay
+  imagePublicId?: string; // <-- para almacenar el public_id de Cloudinary, útil para futuras ediciones o eliminación de la imagen
+  imagePending?: string; // <-- Almacenar la imagen en base64 
   clienteId?: string;
   createdAt?: string;
   deleted?: boolean;
@@ -36,10 +39,13 @@ function normalizeTask(x: any): Task {
     description: x?.description ?? "",
     status:
       x?.status === "Completada" ||
-      x?.status === "En Progreso" ||
+      x?.status === "En progreso" ||
       x?.status === "Pendiente"
         ? x.status
         : "Pendiente",
+    image: x?.image ?? undefined, // undefined si no hay imagen, o URL si la hay
+    imagePublicId: x?.imagePublicId ?? "", // captura el public_id de Cloudinary si viene del backend
+    imagePending: x?.imagePending ?? "", // captura la imagen pendiente en base64 si viene del backend
     clienteId: x?.clienteId,
     createdAt: x?.createdAt,
     deleted: !!x?.deleted,
@@ -53,12 +59,16 @@ export default function Dashboard() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  const [image, setImage] = useState<File | null>(null); // para almacenar la imagen seleccionada antes de subirla a Cloudinary
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<"all" | "active" | "completed">("all");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const [editingDescription, setEditingDescription] = useState("");
+  const [editingImage, setEditingImage] = useState<File | null>(null); // para editar la imagen de una tarea existente
   const [online, setOnline] = useState<boolean>(navigator.onLine);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const editFileInputRef = useRef<HTMLInputElement>(null);  
 
   useEffect(() => {
     setAuth(localStorage.getItem("token"));
@@ -115,10 +125,44 @@ export default function Dashboard() {
   }
 
 
+  async function fileToBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
   async function addTask(e: React.FormEvent) {
     e.preventDefault();
     const t = title.trim();
     const d = description.trim();
+    let imageUrl = null; // <- URL de imagen subida, si hay
+    let imagePublicId = ""; // <- public_id de Cloudinary para esta imagen, si se sube correctamente
+    let imagePending = ""; // <- para mostrar “Subiendo imagen…” mientras se sube a Cloudinary
+
+    if (image){
+      if (navigator.onLine) {
+        const formData = new FormData();
+        formData.append("file", image);
+        formData.append("upload_preset", "react_uploads");     // <- pon tu upload_preset de cloudinary aquí
+
+        const upload = await fetch(
+          "https://api.cloudinary.com/v1_1/dfrnbcqs0/image/upload",
+          { method: "POST", body: formData }
+        );
+    
+        const result = await upload.json();
+        console.log("🖼️ Respuesta Cloudinary completa:", result);  // ver todo el objeto
+        console.log("✅ URL de imagen:", result.secure_url);
+        imageUrl = result.secure_url ?? null; // <- URL segura de Cloudinary o null si falla
+        imagePublicId = result.public_id ?? "";  // ← capturar public_id para futuras ediciones o eliminación de la imagen en Cloudinary
+      }else {
+        imagePending = await fileToBase64(image); 
+      }
+    }
+    
     if (!t) return;
 
     // Crear local inmediatamente
@@ -127,6 +171,9 @@ export default function Dashboard() {
       _id: clienteId,
       title: t,
       description: d,
+      image: imageUrl ?? (imagePending ? imagePending : null), // <- guarda el url de la imagen o documento
+      imagePublicId, // <- guarda la url publica para actualizaciones futuras
+      imagePending, 
       status: "Pendiente" as Status,
       pending: !navigator.onLine, // <- marca “Falta sincronizar” si no hay red
     });
@@ -135,13 +182,15 @@ export default function Dashboard() {
     await putTaskLocal(localTask);
     setTitle("");
     setDescription("");
+    setImage(null); // limpiar selector de imagen
+    if (fileInputRef.current) fileInputRef.current.value = "";
 
     if (!navigator.onLine) {
       const op: OutboxOp = {
         id: "op-" + clienteId,
         op: "create",
         clienteId,
-        data: localTask,
+        data: { ...localTask, imagePending}, //
         ts: Date.now(),
       };
       await queue(op);
@@ -150,7 +199,8 @@ export default function Dashboard() {
 
     // Online directo
     try {
-      const { data } = await api.post("/tasks", { title: t, description: d });
+      console.log("📤 Enviando al backend:", { title: t, description: d, image: imageUrl });
+      const { data } = await api.post("/tasks", { title: t, description: d, image: imageUrl, imagePublicId }); //ENVIAR URL de imagen al backend cuando haya internet
       const created = normalizeTask(data?.task ?? data);
       setTasks((prev) => prev.map((x) => (x._id === clienteId ? created : x)));
       await putTaskLocal(created);
@@ -171,6 +221,7 @@ export default function Dashboard() {
     setEditingId(task._id);
     setEditingTitle(task.title);
     setEditingDescription(task.description ?? "");
+    setEditingImage(task.image ? null : null); // no soportamos editar imagen por ahora, pero aquí podríamos cargarla si quisiéramos
   }
 
   async function saveEdit(taskId: string) {
@@ -179,11 +230,36 @@ export default function Dashboard() {
     if (!newTitle) return;
 
     const before = tasks.find((t) => t._id === taskId);
-    const patched = { ...before, title: newTitle, description: newDesc } as Task;
+    // Subir nueva imagen si hay
+    let imageUrl = before?.image; // conserva la anterior por defecto
+    let imagePublicId = before?.imagePublicId ?? ""; // conserva el public_id anterior por defecto
+    let imagePending = ""; // para mostrar “Subiendo imagen…” mientras se sube a Cloudinary
+
+    if(editingImage){
+      if (navigator.onLine) {
+        const formData = new FormData();
+        formData.append("file", editingImage);
+        formData.append("upload_preset", "react_uploads");
+        const upload = await fetch("https://api.cloudinary.com/v1_1/dfrnbcqs0/image/upload", {
+          method: "POST", body: formData
+        });
+        const result = await upload.json();
+        imageUrl = result.secure_url ?? imageUrl;
+        imagePublicId = result.public_id ?? ""; 
+      } else {
+        // Offline: guardar como base64
+        imagePending = await fileToBase64(editingImage);
+        imageUrl = imagePending; // mostrar localmente
+      }
+    }
+    
+    const patched = { ...before, title: newTitle, description: newDesc, image: imageUrl, imagePending } as Task;
 
     setTasks((prev) => prev.map((t) => (t._id === taskId ? patched : t)));
     await putTaskLocal(patched);
     setEditingId(null);
+    setEditingImage(null);
+    if (editFileInputRef.current) editFileInputRef.current.value = "";
 
     if (!navigator.onLine) {
       await queue({
@@ -191,20 +267,20 @@ export default function Dashboard() {
         op: "update",
         clienteId: isLocalId(taskId) ? taskId : undefined,
         serverId: isLocalId(taskId) ? undefined : taskId,
-        data: { title: newTitle, description: newDesc },
+        data: { title: newTitle, description: newDesc, image: imageUrl, imagePending },
         ts: Date.now(),
       } as OutboxOp);
       return;
     }
 
     try {
-      await api.put(`/tasks/${taskId}`, { title: newTitle, description: newDesc });
+      await api.put(`/tasks/${taskId}`, { title: newTitle, description: newDesc, image: imageUrl, imagePublicId  });
     } catch {
       await queue({
         id: "upd-" + taskId,
         op: "update",
         serverId: taskId,
-        data: { title: newTitle, description: newDesc },
+        data: { title: newTitle, description: newDesc, image: imageUrl, imagePending },
         ts: Date.now(),
       } as OutboxOp);
     }
@@ -329,8 +405,29 @@ export default function Dashboard() {
             placeholder="Descripción (opcional)…"
             rows={2}
           />
+          {/* Selector de imagen y archivo */}
+          <input
+            ref={fileInputRef}  
+            type="file"
+            accept="image/*,application/pdf"
+            onChange={(e) => setImage(e.target.files?.[0] ?? null)}
+          />
+          {image && (
+            image.type === 'application/pdf' ? (
+              <iframe
+                src={URL.createObjectURL(image)}
+                style={{ width: '100%', height: 150, marginTop: 10, borderRadius: 8 }}
+              />
+            ) : (
+              <img 
+                src={URL.createObjectURL(image)}
+                alt="preview"
+                style={{ width: 250, marginTop: 10, borderRadius: 8 }}
+              />
+            )
+          )}
           <button className="btn">Agregar</button>
-        </form>
+        </form> 
 
         {/* ===== Toolbar ===== */}
         <div className="toolbar">
@@ -382,8 +479,9 @@ export default function Dashboard() {
                   title="Estado"
                 >
                   <option value="Pendiente">Pendiente</option>
-                  <option value="En Progreso">En Progreso</option>
+                  <option value="En progreso">En progreso</option>
                   <option value="Completada">Completada</option>
+
                 </select>
 
                 <div className="content">
@@ -403,6 +501,28 @@ export default function Dashboard() {
                         placeholder="Descripción"
                         rows={2}
                       />
+                      {/* Selector de imagen */}
+                      <input
+                      className="edit"
+                      ref={editFileInputRef}  
+                      type="file"
+                      accept="image/*,application/pdf"
+                      onChange={(e) => setEditingImage(e.target.files?.[0] ?? null)}
+                      />
+                      {editingImage && (
+                        editingImage.type === 'application/pdf' ? (
+                          <iframe
+                            src={URL.createObjectURL(editingImage)}
+                            style={{ width: '100%', height: 150, marginTop: 10, borderRadius: 8 }}
+                          />
+                        ) : (
+                          <img 
+                            src={URL.createObjectURL(editingImage)}
+                            alt="preview"
+                            style={{ width: 250, marginTop: 10, borderRadius: 8 }}
+                          />
+                        )
+                      )}
                     </>
                   ) : (
                     <>
@@ -410,6 +530,16 @@ export default function Dashboard() {
                         {t.title}
                       </span>
                       {t.description && <p className="desc">{t.description}</p>}
+                      
+                      {t.image && (
+                        t.image.includes('.pdf') || t.image.includes('/raw/') ? (
+                          <iframe src={t.image} style={{ width: '100%', height: 200, marginTop: 6, borderRadius: 6  }}>
+                            📄 Ver PDF
+                          </iframe>
+                        ) : (
+                          <img src={t.image} alt="imagen de tarea" style={{ width: 100, marginTop: 6, borderRadius: 6 }}/>
+                        )
+                      )}
                       {(t.pending || isLocalId(t._id)) && (
                         <span
                           className="badge"
