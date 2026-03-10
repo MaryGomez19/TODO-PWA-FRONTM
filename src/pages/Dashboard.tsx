@@ -10,7 +10,7 @@ import {
 } from "../offline/db";
 import { syncNow } from "../offline/sync"; // ⬅️ SOLO syncNow
 
-type Status = "Pendiente" | "En Progreso" | "Completada";
+type Status = "Pendiente" | "En progreso" | "Completada";
 
 type Task = {
   _id: string;                 // serverId o clienteId (offline)
@@ -19,6 +19,7 @@ type Task = {
   status: Status;
   image?: string; // URL de imagen asociada, si la hay
   imagePublicId?: string; // <-- para almacenar el public_id de Cloudinary, útil para futuras ediciones o eliminación de la imagen
+  imagePending?: string; // <-- Almacenar la imagen en base64 
   clienteId?: string;
   createdAt?: string;
   deleted?: boolean;
@@ -38,12 +39,13 @@ function normalizeTask(x: any): Task {
     description: x?.description ?? "",
     status:
       x?.status === "Completada" ||
-      x?.status === "En Progreso" ||
+      x?.status === "En progreso" ||
       x?.status === "Pendiente"
         ? x.status
         : "Pendiente",
     image: x?.image ?? undefined, // undefined si no hay imagen, o URL si la hay
     imagePublicId: x?.imagePublicId ?? "", // captura el public_id de Cloudinary si viene del backend
+    imagePending: x?.imagePending ?? "", // captura la imagen pendiente en base64 si viene del backend
     clienteId: x?.clienteId,
     createdAt: x?.createdAt,
     deleted: !!x?.deleted,
@@ -123,29 +125,44 @@ export default function Dashboard() {
   }
 
 
+  async function fileToBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
   async function addTask(e: React.FormEvent) {
     e.preventDefault();
     const t = title.trim();
     const d = description.trim();
     let imageUrl = null; // <- URL de imagen subida, si hay
     let imagePublicId = ""; // <- public_id de Cloudinary para esta imagen, si se sube correctamente
+    let imagePending = ""; // <- para mostrar “Subiendo imagen…” mientras se sube a Cloudinary
 
-    if (image && navigator.onLine) {
-      const formData = new FormData();
-      formData.append("file", image);
-      formData.append("upload_preset", "react_uploads");     // <- pon tu upload_preset de cloudinary aquí
+    if (image){
+      if (navigator.onLine) {
+        const formData = new FormData();
+        formData.append("file", image);
+        formData.append("upload_preset", "react_uploads");     // <- pon tu upload_preset de cloudinary aquí
 
-      const upload = await fetch(
-        "https://api.cloudinary.com/v1_1/dfrnbcqs0/image/upload",
-        { method: "POST", body: formData }
-      );
-  
-      const result = await upload.json();
-      console.log("🖼️ Respuesta Cloudinary completa:", result);  // ver todo el objeto
-      console.log("✅ URL de imagen:", result.secure_url);
-      imageUrl = result.secure_url ?? null; // <- URL segura de Cloudinary o null si falla
-      imagePublicId = result.public_id ?? "";  // ← capturar public_id para futuras ediciones o eliminación de la imagen en Cloudinary
+        const upload = await fetch(
+          "https://api.cloudinary.com/v1_1/dfrnbcqs0/image/upload",
+          { method: "POST", body: formData }
+        );
+    
+        const result = await upload.json();
+        console.log("🖼️ Respuesta Cloudinary completa:", result);  // ver todo el objeto
+        console.log("✅ URL de imagen:", result.secure_url);
+        imageUrl = result.secure_url ?? null; // <- URL segura de Cloudinary o null si falla
+        imagePublicId = result.public_id ?? "";  // ← capturar public_id para futuras ediciones o eliminación de la imagen en Cloudinary
+      }else {
+        imagePending = await fileToBase64(image); 
+      }
     }
+    
     if (!t) return;
 
     // Crear local inmediatamente
@@ -154,8 +171,9 @@ export default function Dashboard() {
       _id: clienteId,
       title: t,
       description: d,
-      image: imageUrl, // <- guarda URL de imagen en la tarea
-      imagePublicId, // <- guarda public_id para futuras referencias
+      image: imageUrl ?? (imagePending ? imagePending : null), // <- guarda el url de la imagen o documento
+      imagePublicId, // <- guarda la url publica para actualizaciones futuras
+      imagePending, 
       status: "Pendiente" as Status,
       pending: !navigator.onLine, // <- marca “Falta sincronizar” si no hay red
     });
@@ -172,7 +190,7 @@ export default function Dashboard() {
         id: "op-" + clienteId,
         op: "create",
         clienteId,
-        data: localTask,
+        data: { ...localTask, imagePending}, //
         ts: Date.now(),
       };
       await queue(op);
@@ -215,19 +233,27 @@ export default function Dashboard() {
     // Subir nueva imagen si hay
     let imageUrl = before?.image; // conserva la anterior por defecto
     let imagePublicId = before?.imagePublicId ?? ""; // conserva el public_id anterior por defecto
+    let imagePending = ""; // para mostrar “Subiendo imagen…” mientras se sube a Cloudinary
 
-    if (editingImage && navigator.onLine) {
-      const formData = new FormData();
-      formData.append("file", editingImage);
-      formData.append("upload_preset", "react_uploads");
-      const upload = await fetch("https://api.cloudinary.com/v1_1/dfrnbcqs0/image/upload", {
-        method: "POST", body: formData
-      });
-      const result = await upload.json();
-      imageUrl = result.secure_url ?? imageUrl;
-      imagePublicId = result.public_id ?? ""; 
+    if(editingImage){
+      if (navigator.onLine) {
+        const formData = new FormData();
+        formData.append("file", editingImage);
+        formData.append("upload_preset", "react_uploads");
+        const upload = await fetch("https://api.cloudinary.com/v1_1/dfrnbcqs0/image/upload", {
+          method: "POST", body: formData
+        });
+        const result = await upload.json();
+        imageUrl = result.secure_url ?? imageUrl;
+        imagePublicId = result.public_id ?? ""; 
+      } else {
+        // Offline: guardar como base64
+        imagePending = await fileToBase64(editingImage);
+        imageUrl = imagePending; // mostrar localmente
+      }
     }
-    const patched = { ...before, title: newTitle, description: newDesc, image: imageUrl } as Task;
+    
+    const patched = { ...before, title: newTitle, description: newDesc, image: imageUrl, imagePending } as Task;
 
     setTasks((prev) => prev.map((t) => (t._id === taskId ? patched : t)));
     await putTaskLocal(patched);
@@ -241,7 +267,7 @@ export default function Dashboard() {
         op: "update",
         clienteId: isLocalId(taskId) ? taskId : undefined,
         serverId: isLocalId(taskId) ? undefined : taskId,
-        data: { title: newTitle, description: newDesc, image: imageUrl },
+        data: { title: newTitle, description: newDesc, image: imageUrl, imagePending },
         ts: Date.now(),
       } as OutboxOp);
       return;
@@ -254,7 +280,7 @@ export default function Dashboard() {
         id: "upd-" + taskId,
         op: "update",
         serverId: taskId,
-        data: { title: newTitle, description: newDesc, image: imageUrl },
+        data: { title: newTitle, description: newDesc, image: imageUrl, imagePending },
         ts: Date.now(),
       } as OutboxOp);
     }
@@ -379,20 +405,27 @@ export default function Dashboard() {
             placeholder="Descripción (opcional)…"
             rows={2}
           />
-          {/* Selector de imagen */}
+          {/* Selector de imagen y archivo */}
           <input
             ref={fileInputRef}  
             type="file"
-            accept="image/*"
+            accept="image/*,application/pdf"
             onChange={(e) => setImage(e.target.files?.[0] ?? null)}
           />
           {image && (
-            <img 
-            src={URL.createObjectURL(image)}
-            alt="preview"
-            style={{ width: 120, marginTop: 10, borderRadius: 8 }}
-            />
-            )}
+            image.type === 'application/pdf' ? (
+              <iframe
+                src={URL.createObjectURL(image)}
+                style={{ width: '100%', height: 150, marginTop: 10, borderRadius: 8 }}
+              />
+            ) : (
+              <img 
+                src={URL.createObjectURL(image)}
+                alt="preview"
+                style={{ width: 250, marginTop: 10, borderRadius: 8 }}
+              />
+            )
+          )}
           <button className="btn">Agregar</button>
         </form> 
 
@@ -446,7 +479,7 @@ export default function Dashboard() {
                   title="Estado"
                 >
                   <option value="Pendiente">Pendiente</option>
-                  <option value="En Progreso">En Progreso</option>
+                  <option value="En progreso">En progreso</option>
                   <option value="Completada">Completada</option>
 
                 </select>
@@ -473,11 +506,22 @@ export default function Dashboard() {
                       className="edit"
                       ref={editFileInputRef}  
                       type="file"
-                      accept="image/*"
+                      accept="image/*,application/pdf"
                       onChange={(e) => setEditingImage(e.target.files?.[0] ?? null)}
                       />
                       {editingImage && (
-                        <img src={URL.createObjectURL(editingImage)} alt="preview" style={{ width: 80, borderRadius: 6 }} />
+                        editingImage.type === 'application/pdf' ? (
+                          <iframe
+                            src={URL.createObjectURL(editingImage)}
+                            style={{ width: '100%', height: 150, marginTop: 10, borderRadius: 8 }}
+                          />
+                        ) : (
+                          <img 
+                            src={URL.createObjectURL(editingImage)}
+                            alt="preview"
+                            style={{ width: 250, marginTop: 10, borderRadius: 8 }}
+                          />
+                        )
                       )}
                     </>
                   ) : (
@@ -486,7 +530,16 @@ export default function Dashboard() {
                         {t.title}
                       </span>
                       {t.description && <p className="desc">{t.description}</p>}
-                      {t.image && (<img src={t.image} alt="imagen de tarea" style={{ width: 100, marginTop: 6, borderRadius: 6 }}/>)} 
+                      
+                      {t.image && (
+                        t.image.includes('.pdf') || t.image.includes('/raw/') ? (
+                          <iframe src={t.image} style={{ width: '100%', height: 200, marginTop: 6, borderRadius: 6  }}>
+                            📄 Ver PDF
+                          </iframe>
+                        ) : (
+                          <img src={t.image} alt="imagen de tarea" style={{ width: 100, marginTop: 6, borderRadius: 6 }}/>
+                        )
+                      )}
                       {(t.pending || isLocalId(t._id)) && (
                         <span
                           className="badge"
